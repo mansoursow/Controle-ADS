@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__Claude_in_Chrome__tabs_context_mcp",
+      "Bash(python -c ':*)",
+      "Bash(python3)",
+      "Bash(python3 -c ':*)",
+      "Bash(.venv/Scripts/pip show:*)",
+      "Bash(pip show *)",
+      "Bash(python -m markitdown \"C:\\\\Users\\\\Lenovo\\\\Desktop\\\\Accountech AI\\\\PITCH ACCOUNTECH AI 27022026.pptx \\(1\\).pptx\")",
+      "Read(//c//**)",
+      "Bash(pip install *)",
+      "Bash(python -m markitdown \"C:/Users/Lenovo/Desktop/Accountech AI/PITCH ACCOUNTECH AI 27022026.pptx \\(1\\).pptx\")",
+      "WebFetch(domain:www.sage.com)",
+      "WebFetch(domain:vic.ai)",
+      "Bash(python -c \"import main; print\\('OK'\\)\")",
+      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('main.py'\\).read\\(\\)\\); print\\('Syntaxe OK'\\)\")",
+      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('main.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(.venv/Scripts/pip install *)",
+      "Bash(.venv/Scripts/python)",
+      "Bash(.venv/Scripts/python -c \"import openpyxl; print\\('openpyxl', openpyxl.__version__, 'OK'\\)\")",
+      "Bash(python3 -c ' *)",
+      "Bash(.venv/Scripts/python -c ' *)"
+    ]
+  }
+}
