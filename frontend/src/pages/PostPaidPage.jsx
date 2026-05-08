@@ -9,27 +9,18 @@ const STATUT_CONFIG = {
   sousfacture: { label: 'SOUS-FACTURATION', bg: 'bg-amber-100',   text: 'text-amber-800',   dot: 'bg-amber-500'   },
 };
 
-const FILE_ZONE_COLORS = {
-  violet: {
-    drag:   'border-violet-500 bg-violet-50',
-    static: 'border-slate-300 bg-white',
-    btn:    'bg-violet-600 hover:bg-violet-700',
-  },
-  indigo: {
-    drag:   'border-indigo-500 bg-indigo-50',
-    static: 'border-slate-300 bg-white',
-    btn:    'bg-indigo-600 hover:bg-indigo-700',
-  },
-};
-
-function FileZone({ label, icon, color, accept, multiple, files, onFiles }) {
+// Zone péage : drag & drop + bouton Fichiers + bouton Dossier
+function PeageDropZone({ files, onFiles }) {
   const [dragging, setDragging] = useState(false);
-  const inputRef = useRef(null);
-  const colors = FILE_ZONE_COLORS[color] || FILE_ZONE_COLORS.violet;
+  const fileRef   = useRef(null);
+  const folderRef = useRef(null);
 
   const handle = (fileList) => {
     const valid = Array.from(fileList).filter(f => /\.(xlsx|xls|csv)$/i.test(f.name));
-    if (valid.length) onFiles(valid);
+    if (valid.length) onFiles(prev => {
+      const existing = new Set(prev.map(f => f.name + f.size));
+      return [...prev, ...valid.filter(f => !existing.has(f.name + f.size))];
+    });
   };
 
   return (
@@ -37,35 +28,76 @@ function FileZone({ label, icon, color, accept, multiple, files, onFiles }) {
       onDragOver={e => { e.preventDefault(); setDragging(true); }}
       onDragLeave={() => setDragging(false)}
       onDrop={e => { e.preventDefault(); setDragging(false); handle(e.dataTransfer.files); }}
-      className={`border-2 border-dashed rounded-2xl p-6 transition-all ${dragging ? colors.drag : colors.static}`}
+      className={`border-2 border-dashed rounded-2xl p-6 text-center transition-all select-none
+        ${dragging ? 'border-violet-500 bg-violet-50' : 'border-slate-300 bg-white'}`}
     >
-      <div className="text-3xl mb-2 text-center">{icon}</div>
-      <p className="font-bold text-slate-700 text-center mb-1 text-sm">{label}</p>
-      <p className="text-xs text-slate-400 text-center mb-4">.xlsx · .xls · .csv</p>
-
-      <div className="flex justify-center">
-        <button
-          type="button"
-          onClick={() => inputRef.current?.click()}
-          className={`${colors.btn} text-white text-xs font-semibold px-4 py-2 rounded-lg transition-colors`}
-        >
-          Choisir {multiple ? 'des fichiers' : 'un fichier'}
+      <div className="text-3xl mb-2">🗂️</div>
+      <p className="font-bold text-slate-700 mb-1 text-sm">Glissez vos fichiers ou un dossier ici</p>
+      <p className="text-xs text-slate-400 mb-4">.xlsx · .xls · .csv — fichiers et sous-dossiers inclus</p>
+      <div className="flex gap-3 justify-center">
+        <button type="button" onClick={() => fileRef.current?.click()}
+          className="px-4 py-2 rounded-xl bg-violet-600 hover:bg-violet-700 text-white text-xs font-bold shadow transition-all">
+          📄 Fichiers
         </button>
-        <input
-          ref={inputRef}
-          type="file"
-          accept={accept}
-          multiple={multiple}
-          className="hidden"
-          onChange={e => handle(e.target.files)}
-        />
+        <button type="button" onClick={() => folderRef.current?.click()}
+          className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold shadow transition-all">
+          🗂 Dossier
+        </button>
+      </div>
+      <input ref={fileRef}   type="file" multiple accept=".xlsx,.xls,.csv" className="hidden" onChange={e => handle(e.target.files)} />
+      <input ref={folderRef} type="file" webkitdirectory="true" multiple   className="hidden" onChange={e => handle(e.target.files)} />
+
+      {files.length > 0 && (
+        <ul className="mt-4 space-y-1 text-left max-h-40 overflow-y-auto">
+          {files.map((f, i) => (
+            <li key={i} className="flex items-center justify-between bg-white border border-slate-200 rounded-lg px-3 py-1.5 text-xs">
+              <span className="text-slate-700 font-medium truncate max-w-[200px]">{f.name}</span>
+              <span className="text-slate-400 ml-2 shrink-0">{fmtSize(f.size)}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+// Zone simple pour les factures (fichiers individuels)
+function FactureFileZone({ files, onFiles }) {
+  const [dragging, setDragging] = useState(false);
+  const inputRef = useRef(null);
+
+  const handle = (fileList) => {
+    const valid = Array.from(fileList).filter(f => /\.(xlsx|xls|csv)$/i.test(f.name));
+    if (valid.length) onFiles(prev => {
+      const existing = new Set(prev.map(f => f.name + f.size));
+      return [...prev, ...valid.filter(f => !existing.has(f.name + f.size))];
+    });
+  };
+
+  return (
+    <div
+      onDragOver={e => { e.preventDefault(); setDragging(true); }}
+      onDragLeave={() => setDragging(false)}
+      onDrop={e => { e.preventDefault(); setDragging(false); handle(e.dataTransfer.files); }}
+      className={`border-2 border-dashed rounded-2xl p-6 text-center transition-all select-none
+        ${dragging ? 'border-indigo-500 bg-indigo-50' : 'border-slate-300 bg-white'}`}
+    >
+      <div className="text-3xl mb-2">🧾</div>
+      <p className="font-bold text-slate-700 mb-1 text-sm">Glissez vos factures ici</p>
+      <p className="text-xs text-slate-400 mb-4">.xlsx · .xls · .csv</p>
+      <div className="flex justify-center">
+        <button type="button" onClick={() => inputRef.current?.click()}
+          className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold shadow transition-all">
+          📄 Choisir des fichiers
+        </button>
+        <input ref={inputRef} type="file" multiple accept=".xlsx,.xls,.csv" className="hidden" onChange={e => handle(e.target.files)} />
       </div>
 
       {files.length > 0 && (
-        <ul className="mt-4 space-y-1">
+        <ul className="mt-4 space-y-1 text-left max-h-40 overflow-y-auto">
           {files.map((f, i) => (
             <li key={i} className="flex items-center justify-between bg-white border border-slate-200 rounded-lg px-3 py-1.5 text-xs">
-              <span className="text-slate-700 font-medium truncate max-w-[180px]">{f.name}</span>
+              <span className="text-slate-700 font-medium truncate max-w-[200px]">{f.name}</span>
               <span className="text-slate-400 ml-2 shrink-0">{fmtSize(f.size)}</span>
             </li>
           ))}
@@ -205,15 +237,7 @@ export default function PostPaidPage({ onBack }) {
               Fichiers de transactions du péage contenant les plaques d'immatriculation
               (mêmes fichiers que l'Analyse des Recettes).
             </p>
-            <FileZone
-              label="Fichiers péage (transactions)"
-              icon="🛣️"
-              color="violet"
-              accept=".xlsx,.xls,.csv"
-              multiple
-              files={fichiersPeage}
-              onFiles={setFichiersPeage}
-            />
+            <PeageDropZone files={fichiersPeage} onFiles={setFichiersPeage} />
           </div>
 
           <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
@@ -224,15 +248,7 @@ export default function PostPaidPage({ onBack }) {
               Fichiers de facturation mensuelle des clients post-paid (ex : SAGAM, SENAS AUCHAN…)
               listant les plaques et le nombre de passages facturés.
             </p>
-            <FileZone
-              label="Fichiers factures clients"
-              icon="💳"
-              color="indigo"
-              accept=".xlsx,.xls,.csv"
-              multiple
-              files={fichiersFactures}
-              onFiles={setFichiersFactures}
-            />
+            <FactureFileZone files={fichiersFactures} onFiles={setFichiersFactures} />
           </div>
         </div>
 
