@@ -1066,6 +1066,11 @@ GARE_PEAGE_COLS = (
     'NomGareSortie', 'NomGareEntree', 'Gare', 'Station', 'GarePeage',
     'NomGare', 'LibelleGare', 'Peage',
 )
+GARE_ENTREE_PEAGE_COLS = ('NomGareEntree', 'GareEntree', 'Entree', 'StationEntree', 'LibelleGareEntree')
+GARE_SORTIE_PEAGE_COLS = ('NomGareSortie', 'GareSortie', 'Sortie', 'StationSortie', 'LibelleGareSortie')
+TARIF_PEAGE_COLS = ('TotalPaye', 'Total', 'Montant', 'TotalTTC', 'Tarif', 'Prix', 'MontantTotal', 'Recette', 'Espece')
+DATE_PEAGE_COLS  = ('DateHeureSortie', 'DateHeureEntree', 'DateHeure', 'DateSortie', 'DateEntree', 'Date', 'DatePassage')
+CLASSE_PEAGE_COLS = ('ClasseFacturee', 'ClasseDetectee_Entree', 'ClasseDetectee', 'Classe', 'Category', 'TypeVehicule', 'Categorie')
 
 
 def _norm(s: str) -> str:
@@ -1202,8 +1207,8 @@ def _parse_facture_file(content: bytes, filename: str) -> list[dict]:
 
 def _extract_passages_peage(content: bytes, filename: str) -> dict[str, list]:
     """
-    Lit un fichier péage et retourne un dict {plaque_upper: [gare1, gare2, ...]}.
-    Chaque élément de la liste est la gare de passage (ou '' si inconnue).
+    Lit un fichier péage et retourne un dict {plaque_upper: [passage_dict, ...]}.
+    Chaque passage_dict contient : gare_e, gare_s, date, montant, classe.
     """
     ext = os.path.splitext(filename)[1].lower()
     if ext in ('.xlsx', '.xlsm'):
@@ -1217,8 +1222,16 @@ def _extract_passages_peage(content: bytes, filename: str) -> dict[str, list]:
 
     df.columns = [str(c).strip() for c in df.columns]
     cols = list(df.columns)
-    col_plaque = _pick_col(cols, *PLAQUE_PEAGE_COLS)
-    col_gare   = _pick_col(cols, *GARE_PEAGE_COLS)
+    col_plaque  = _pick_col(cols, *PLAQUE_PEAGE_COLS)
+    col_gare_e  = _pick_col(cols, *GARE_ENTREE_PEAGE_COLS)
+    col_gare_s  = _pick_col(cols, *GARE_SORTIE_PEAGE_COLS)
+    col_tarif   = _pick_col(cols, *TARIF_PEAGE_COLS)
+    col_date    = _pick_col(cols, *DATE_PEAGE_COLS)
+    col_classe  = _pick_col(cols, *CLASSE_PEAGE_COLS)
+
+    # Si pas de colonnes entrée/sortie séparées, fallback générique
+    if not col_gare_e and not col_gare_s:
+        col_gare_e = _pick_col(cols, *GARE_PEAGE_COLS)
 
     # Colonne secondaire pour les CSV à double champ LPR (entrée + sortie)
     col_plaque2 = None
@@ -1239,17 +1252,29 @@ def _extract_passages_peage(content: bytes, filename: str) -> dict[str, list]:
             plaque = str(row.get(col_plaque2, '')).strip().upper()
         if not plaque or plaque in SKIP:
             continue
-        gare = str(row.get(col_gare, '')).strip() if col_gare else ''
+
+        entry: dict = {}
+        if col_gare_e:
+            entry['gare_e'] = str(row.get(col_gare_e, '')).strip()
+        if col_gare_s:
+            entry['gare_s'] = str(row.get(col_gare_s, '')).strip()
+        if col_date:
+            entry['date'] = str(row.get(col_date, '')).strip()
+        if col_tarif:
+            entry['montant'] = _safe_float(row.get(col_tarif))
+        if col_classe:
+            entry['classe'] = str(row.get(col_classe, '')).strip()
+
         if plaque not in passages:
             passages[plaque] = []
-        passages[plaque].append(gare)
+        passages[plaque].append(entry)
 
     return passages
 
 
 def _pp_cache_key_peage(content: bytes) -> str:
     h = hashlib.sha256()
-    h.update(b"postpaid-peage|v1|")
+    h.update(b"postpaid-peage|v3|")  # v3: passage dicts with montant/date/classe
     h.update(content)
     return h.hexdigest()
 
@@ -1314,6 +1339,12 @@ async def count_peage_file(request: Request):
             return JSONResponse({"error": "Fichier manquant"}, status_code=400)
         nom = fichier.filename
         content = await fichier.read()
+        # Plaques cibles : on ne renvoie le détail complet que pour ces plaques
+        try:
+            raw_cibles = form.get("plaques_cibles", "") or ""
+            plaques_cibles: set = set(json.loads(raw_cibles)) if raw_cibles else set()
+        except Exception:
+            plaques_cibles = set()
     except Exception as e:
         traceback.print_exc()
         return JSONResponse({"error": f"Lecture du fichier impossible : {e}"}, status_code=400)
@@ -1332,8 +1363,18 @@ async def count_peage_file(request: Request):
                 _cache_set(key, {'plaques': passages})
                 yield f"data: {json.dumps({'type': 'progress', 'message': f'{nom} : {len(passages)} plaques trouvées'})}\n\n"
 
-            counts = {p: len(gares) for p, gares in passages.items()}
-            yield f"data: {json.dumps({'type': 'resultat', 'counts': counts, 'fichier': nom})}\n\n"
+            counts: dict = {}
+            details: dict = {}
+            for plaque, plist in passages.items():
+                counts[plaque] = len(plist)
+                if plaque in plaques_cibles:
+                    montant_total = sum(
+                        p.get('montant', 0) for p in plist
+                        if isinstance(p, dict) and p.get('montant') is not None
+                    )
+                    details[plaque] = {'montant': montant_total, 'passages': plist}
+
+            yield f"data: {json.dumps({'type': 'resultat', 'counts': counts, 'details': details, 'fichier': nom})}\n\n"
 
         except Exception as e:
             traceback.print_exc()
