@@ -1249,16 +1249,17 @@ def _pp_cache_key_facture(content: bytes) -> str:
 
 
 @app.post("/controle-postpaid")
-async def controle_postpaid(
-    fichiers_peage:    list[UploadFile] = File(...),
-    fichiers_factures: list[UploadFile] = File(...),
-):
+async def controle_postpaid(request: Request):
     """
     Contrôle Recette Post Paid.
     Compare les passages réels (données péage) avec les passages facturés
     pour chaque plaque d'immatriculation.
     Cache SHA256 par fichier pour éviter de re-parser les fichiers déjà connus.
     """
+    form_data = await request.form(max_files=10_000, max_fields=100)
+    fichiers_peage    = [v for k, v in form_data.multi_items() if k == "fichiers_peage"]
+    fichiers_factures = [v for k, v in form_data.multi_items() if k == "fichiers_factures"]
+
     async def generate():
         try:
             total_steps = len(fichiers_peage) + len(fichiers_factures) + 1  # +1 rapprochement
