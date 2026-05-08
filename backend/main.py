@@ -1241,24 +1241,102 @@ def _pp_cache_key_peage(content: bytes) -> str:
     return h.hexdigest()
 
 
-def _pp_cache_key_facture(content: bytes) -> str:
-    h = hashlib.sha256()
-    h.update(b"postpaid-facture|v1|")
-    h.update(content)
-    return h.hexdigest()
+def _read_plaques_file(content: bytes, filename: str) -> list[str]:
+    """Lit un fichier liste de plaques et retourne la liste complète (avec doublons)."""
+    df = _read_file_to_df(content, filename)
+    df.columns = [str(c).strip() for c in df.columns]
+    col = _pick_col(list(df.columns), *PLAQUE_PEAGE_COLS,
+                    "Plaque d'immatriculation", 'Plaque d immatriculation')
+    if col is None:
+        col = df.columns[0]
+    skip = {'nan', 'none', '', 'plaque', 'immatriculation', 'matricule',
+            "plaque d'immatriculation", 'plaque d immatriculation'}
+    plates = []
+    for v in df[col]:
+        p = str(v).strip().upper()
+        if p and p.lower() not in skip:
+            plates.append(p)
+    return plates
 
 
+@app.post("/controle-postpaid/plaques")
+async def read_plaques_endpoint(request: Request):
+    """
+    Lit un fichier liste de plaques (colonne unique) et retourne la liste avec comptages.
+    Requête légère — fichier tiny, réponse JSON directe.
+    """
+    form = await request.form(max_files=1, max_fields=10)
+    fichier = form.get("fichier_plaques")
+    if not fichier:
+        return JSONResponse({"error": "Aucun fichier fourni"}, status_code=400)
+    try:
+        content = await fichier.read()
+        plaques_raw = _read_plaques_file(content, fichier.filename)
+        counts: dict[str, int] = {}
+        for p in plaques_raw:
+            counts[p] = counts.get(p, 0) + 1
+        result = [{"plaque": p, "nb_liste": n} for p, n in sorted(counts.items())]
+        return JSONResponse({
+            "plaques": result,
+            "total_lignes": len(plaques_raw),
+            "total_uniques": len(counts),
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/controle-postpaid/peage-file")
+async def count_peage_file(request: Request):
+    """
+    Compte les passages par plaque dans UN seul fichier péage.
+    Envoi fichier par fichier depuis le frontend (évite les gros uploads multipart).
+    Cache SHA256 — deuxième upload du même fichier = réponse instantanée.
+    """
+    async def generate():
+        try:
+            form = await request.form(max_files=1, max_fields=10)
+            fichier = form.get("fichier_peage")
+            if not fichier:
+                yield f"data: {json.dumps({'type': 'erreur', 'message': 'Fichier manquant'})}\n\n"
+                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                return
+
+            nom = fichier.filename
+            content = await fichier.read()
+            key = _pp_cache_key_peage(content)
+            cached = _cache_get(key)
+
+            if cached is not None:
+                passages = cached.get('plaques', {})
+                yield f"data: {json.dumps({'type': 'progress', 'message': f'⚡ {nom} (cache) : {len(passages)} plaques'})}\n\n"
+            else:
+                yield f"data: {json.dumps({'type': 'progress', 'message': f'Lecture {nom}…'})}\n\n"
+                passages = _extract_passages_peage(content, nom)
+                _cache_set(key, {'plaques': passages})
+                yield f"data: {json.dumps({'type': 'progress', 'message': f'{nom} : {len(passages)} plaques trouvées'})}\n\n"
+
+            # Retourner le comptage : {plaque: nb_passages}
+            counts = {p: len(gares) for p, gares in passages.items()}
+            yield f"data: {json.dumps({'type': 'resultat', 'counts': counts, 'fichier': nom})}\n\n"
+
+        except Exception as e:
+            traceback.print_exc()
+            yield f"data: {json.dumps({'type': 'erreur', 'message': str(e)})}\n\n"
+
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+# ── ancienne route (compatibilité) ──────────────────────────────────────────
 @app.post("/controle-postpaid")
 async def controle_postpaid(request: Request):
-    """
-    Contrôle Recette Post Paid.
-    Compare les passages réels (données péage) avec les passages facturés
-    pour chaque plaque d'immatriculation.
-    Cache SHA256 par fichier pour éviter de re-parser les fichiers déjà connus.
-    """
-    form_data = await request.form(max_files=10_000, max_fields=100)
-    fichiers_peage    = [v for k, v in form_data.multi_items() if k == "fichiers_peage"]
-    fichiers_factures = [v for k, v in form_data.multi_items() if k == "fichiers_factures"]
+    """Redirige vers les nouveaux endpoints — conservé pour compatibilité."""
+    async def generate():
+        yield f"data: {json.dumps({'type': 'erreur', 'message': 'Utilisez /controle-postpaid/plaques et /controle-postpaid/peage-file'})}\n\n"
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
     async def generate():
         try:
