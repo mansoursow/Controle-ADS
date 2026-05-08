@@ -12,7 +12,8 @@ export default defineConfig({
       '/recettes':       { target: 'http://localhost:8000', changeOrigin: true, proxyTimeout: 120_000, timeout: 120_000 },
       '/analyser-excel': { target: 'http://localhost:8000', changeOrigin: true, proxyTimeout: 600_000, timeout: 600_000 },
       '/comparer':       { target: 'http://localhost:8000', changeOrigin: true, proxyTimeout: 60_000,  timeout: 60_000 },
-      '/comparer-totaux':{ target: 'http://localhost:8000', changeOrigin: true, proxyTimeout: 60_000,  timeout: 60_000 },
+      '/comparer-totaux':     { target: 'http://localhost:8000', changeOrigin: true, proxyTimeout: 60_000,  timeout: 60_000 },
+      '/controle-postpaid':   { target: 'http://localhost:8000', changeOrigin: true, proxyTimeout: 600_000, timeout: 600_000 },
     },
   },
 })

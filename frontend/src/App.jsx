@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import AuditPage from './pages/AuditPage';
 import RecettesPage from './pages/RecettesPage';
+import PostPaidPage from './pages/PostPaidPage';
 
 function HomePage({ onNavigate }) {
   return (
@@ -14,7 +15,7 @@ function HomePage({ onNavigate }) {
         </p>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-8 w-full max-w-4xl">
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-8 w-full max-w-5xl">
         {/* Audit IA */}
         <button
           onClick={() => onNavigate('audit')}
@@ -46,6 +47,22 @@ function HomePage({ onNavigate }) {
             Lancer l'analyse <span className="text-lg">→</span>
           </div>
         </button>
+
+        {/* Contrôle Post Paid */}
+        <button
+          onClick={() => onNavigate('postpaid')}
+          className="group bg-white/5 hover:bg-violet-600 border border-white/10 hover:border-violet-500 rounded-3xl p-10 text-left transition-all duration-300 shadow-2xl hover:shadow-violet-900/40 hover:-translate-y-1"
+        >
+          <div className="text-5xl mb-6">💳</div>
+          <h2 className="text-2xl font-extrabold text-white mb-3">Contrôle Post Paid</h2>
+          <p className="text-slate-400 group-hover:text-violet-100 text-sm leading-relaxed transition-colors">
+            Rapprochement des passages péage réels avec les factures des clients
+            post-paid. Détection des surfacturations et sous-facturations par plaque.
+          </p>
+          <div className="mt-8 flex items-center gap-2 text-violet-400 group-hover:text-white font-bold text-sm transition-colors">
+            Lancer le contrôle <span className="text-lg">→</span>
+          </div>
+        </button>
       </div>
 
       <p className="mt-16 text-slate-600 text-xs">
@@ -60,5 +77,6 @@ export default function App() {
 
   if (page === 'audit')    return <AuditPage    onBack={() => setPage('home')} />;
   if (page === 'recettes') return <RecettesPage onBack={() => setPage('home')} />;
+  if (page === 'postpaid') return <PostPaidPage onBack={() => setPage('home')} />;
   return <HomePage onNavigate={setPage} />;
 }

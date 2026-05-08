@@ -7,6 +7,9 @@ import glob as glob_module
 import base64
 import time
 import traceback
+import unicodedata
+import hashlib
+from pathlib import Path
 import pandas as pd
 import openai
 from openai import AsyncOpenAI
@@ -557,6 +560,22 @@ def _parse_periode(val, granularite: str) -> str | None:
                 if granularite == 'jour':  return f"{y}-{m}-{d}"
                 if granularite == 'mois':  return f"{y}-{m}"
                 return y
+            # Variante fréquente: MM/YYYY ou M/YYYY
+            if len(p) == 2 and p[0].strip().isdigit() and p[1].strip()[:4].isdigit():
+                m = p[0].strip().zfill(2)
+                y = p[1].strip()[:4]
+                if granularite == 'jour':  return f"{y}-{m}-01"
+                if granularite == 'mois':  return f"{y}-{m}"
+                return y
+    except Exception:
+        pass
+    # Excel serial date (nombre de jours depuis 1899-12-30)
+    try:
+        if isinstance(val, (int, float)) and val > 10_000:
+            dt = pd.to_datetime(val, unit='D', origin='1899-12-30', errors='coerce')
+            if pd.notna(dt):
+                fmt = {'jour': '%Y-%m-%d', 'mois': '%Y-%m', 'annee': '%Y'}
+                return dt.strftime(fmt.get(granularite, '%Y-%m'))
     except Exception:
         pass
     # Fallback: pandas
@@ -572,7 +591,10 @@ class Aggregateur:
     """Agrège les données à la volée, sans stocker toutes les lignes."""
 
     DATE_COLS   = ('DateHeureSortie', 'DateSortie', 'Date_Sortie', 'DateTransaction',
-                   'Date', 'Heure_Sortie', 'DateHeure', 'Datetime', 'Timestamp')
+                   'Date', 'Heure_Sortie', 'DateHeure', 'Datetime', 'Timestamp',
+                   # Variantes fréquentes (exports Excel / rapports)
+                   'Date Heure Sortie', 'Date/Heure Sortie', 'Date Heure', 'Date/Heure',
+                   'Date Sortie', 'Date de sortie', 'Date_Heure_Sortie')
     ESPECE_COLS = ('Espece', 'Especes', 'MontantEspece', 'Montant_Espece', 'RecetteEspece',
                    'Recette_Espece', 'PayeEspece', 'Paye_Espece', 'Espece_Paye',
                    'Cash', 'Liquide', 'MTC', 'MontantMTC', 'Montant_MTC',
@@ -584,7 +606,9 @@ class Aggregateur:
                    'TelepeagePaye', 'Telepeage', 'Paiement_ETC', 'PaiementETC')
     TOTAL_COLS  = ('TotalPaye', 'Total_Paye', 'MontantTotal', 'Montant_Total',
                    'TotalMontant', 'Total', 'Montant', 'RecetteTotale', 'Recette_Totale',
-                   'Recette', 'Amount', 'AmountTotal', 'TotalAmount')
+                   'Recette', 'Amount', 'AmountTotal', 'TotalAmount',
+                   # Variantes fréquentes
+                   'Total Paye', 'Total Payé', 'Montant Total', 'Montant total', 'Recette totale')
     CLASSE_COLS = ('ClasseFacturee', 'Classe_Facturee', 'ClasseDetectee', 'ClasseDetectee_Sortie',
                    'Classe', 'Categorie', 'Category', 'TypeVehicule', 'Type_Vehicule',
                    'CategorieVehicule', 'Categorie_Vehicule', 'ClasseVehicule')
@@ -603,20 +627,46 @@ class Aggregateur:
         self._mode_col   = None  # colonne mode de paiement (fallback)
         self.detected_cols: dict = {}  # pour diagnostic
 
+    @staticmethod
+    def _norm_header(s: str) -> str:
+        """
+        Normalise un en-tête pour matcher malgré accents / espaces / ponctuation.
+        Ex: "Total Payé" -> "totalpaye", "Date/Heure Sortie" -> "dateheuresortie"
+        """
+        if s is None:
+            return ""
+        s = str(s).strip().lower()
+        s = unicodedata.normalize("NFKD", s)
+        s = "".join(ch for ch in s if not unicodedata.combining(ch))
+        # garder uniquement alphanum (supprime espaces, _, -, /, etc.)
+        s = re.sub(r"[^a-z0-9]+", "", s)
+        return s
+
     def _detect_cols(self, headers: list[str]):
-        h_low = {h.strip(): h for h in headers}
+        # Map normalisée -> header original (premier gagnant)
+        norm_map: dict[str, str] = {}
+        for h in headers:
+            h_orig = str(h).strip()
+            key = self._norm_header(h_orig)
+            if key and key not in norm_map:
+                norm_map[key] = h_orig
+
         def pick(*names):
-            # Exact match d'abord
-            for n in names:
-                for h_stripped, h_orig in h_low.items():
-                    if n.lower() == h_stripped.lower():
-                        return h_orig
-            # Substring match ensuite
-            for n in names:
-                for h_stripped, h_orig in h_low.items():
-                    if n.lower() in h_stripped.lower():
+            # Match normalisé (exact puis substring) pour tolérer les variations.
+            needles = [self._norm_header(n) for n in names if n]
+            if not needles:
+                return None
+            # Exact d'abord
+            for nd in needles:
+                if nd in norm_map:
+                    return norm_map[nd]
+            # Substring ensuite (needle dans header ou header dans needle)
+            for nd in needles:
+                for hk, h_orig in norm_map.items():
+                    if nd and (nd in hk or hk in nd):
                         return h_orig
             return None
+
         self._date_col = pick(*self.DATE_COLS)
         self._esp_col  = pick(*self.ESPECE_COLS)
         self._etc_col  = pick(*self.ETC_COLS)
@@ -693,9 +743,24 @@ class Aggregateur:
             return
         fmt = {'jour': '%Y-%m-%d', 'mois': '%Y-%m', 'annee': '%Y'}.get(self.gran, '%Y-%m')
         df = df.copy()
-        df['_dt'] = pd.to_datetime(df[date_col].astype(str), dayfirst=True, errors='coerce')
-        df = df.dropna(subset=['_dt'])
-        df['_per'] = df['_dt'].dt.strftime(fmt)
+        # Parsing dates: d'abord pandas (rapide), puis fallback ligne-à-ligne pour les formats exotiques
+        raw_dates = df[date_col]
+        dt = pd.to_datetime(raw_dates.astype(str), dayfirst=True, errors='coerce')
+        if dt.isna().any():
+            # Fallback uniquement sur les lignes non parsées
+            mask = dt.isna()
+            fallback = raw_dates[mask].apply(lambda v: _parse_periode(v, self.gran))
+            # Reconstruire une colonne période hybride
+            per = pd.Series(index=df.index, dtype="object")
+            per[~mask] = dt[~mask].dt.strftime(fmt)
+            per[mask] = fallback
+            df['_per'] = per
+            df = df.dropna(subset=['_per'])
+        else:
+            df['_dt'] = dt
+            df['_per'] = df['_dt'].dt.strftime(fmt)
+            df = df.dropna(subset=['_per'])
+
         for col in [esp_col, etc_col, tot_col]:
             if col and col in df.columns:
                 df[col] = pd.to_numeric(
@@ -765,6 +830,39 @@ class Aggregateur:
         return rows, totals
 
 
+def _cache_dir() -> Path:
+    # Par défaut: backend/.cache (persistant sur disque)
+    return Path(os.getenv("CACHE_DIR", Path(__file__).parent / ".cache"))
+
+
+def _cache_key(content: bytes, granularite: str) -> str:
+    h = hashlib.sha256()
+    h.update(b"analyser-excel|v1|")
+    h.update(granularite.encode("utf-8", errors="ignore"))
+    h.update(b"|")
+    h.update(content)
+    return h.hexdigest()
+
+
+def _cache_get(key: str) -> dict | None:
+    p = _cache_dir() / f"{key}.json"
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _cache_set(key: str, payload: dict) -> None:
+    d = _cache_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / f"{key}.json"
+    tmp = d / f"{key}.tmp"
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(p)
+
+
 @app.post("/analyser-excel")
 async def analyser_excel(
     fichier: UploadFile = File(...),
@@ -777,13 +875,25 @@ async def analyser_excel(
         nom = fichier.filename
         ext = os.path.splitext(nom)[1].lower()
         agg = Aggregateur(granularite)
-        n_rows   = 0
-        n_errors = 0
+        n_rows: int = 0
+        n_errors: int = 0
 
         yield f"data: {json.dumps({'type': 'fichier_debut', 'nom': nom})}\n\n"
 
         try:
             content = await fichier.read()
+            # Cache persistant: si le fichier (contenu) et la granularité n'ont pas changé,
+            # on renvoie immédiatement les résultats.
+            key = _cache_key(content, granularite)
+            cached = _cache_get(key)
+            if cached is not None:
+                yield f"data: {json.dumps({'type': 'cache_hit', 'nom': nom})}\n\n"
+                yield f"data: {json.dumps({'type': 'fichier_done', 'nom': nom, 'rows': cached.get('rows', 0), 'errors': cached.get('errors', 0)})}\n\n"
+                if cached.get("detected"):
+                    yield f"data: {json.dumps({'type': 'colonnes', 'detected': cached.get('detected')})}\n\n"
+                yield f"data: {json.dumps({'type': 'resultat', 'data': cached.get('data', []), 'totals': cached.get('totals', {})})}\n\n"
+                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                return
 
             if ext in ('.xlsx', '.xlsm', '.xlam'):
                 wb = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
@@ -827,6 +937,17 @@ async def analyser_excel(
             yield f"data: {json.dumps({'type': 'fichier_done', 'nom': nom, 'rows': n_rows, 'errors': n_errors})}\n\n"
             yield f"data: {json.dumps({'type': 'colonnes', 'detected': agg.detected_cols})}\n\n"
             yield f"data: {json.dumps({'type': 'resultat', 'data': rows, 'totals': totals})}\n\n"
+            _cache_set(key, {
+                "key": key,
+                "nom": nom,
+                "granularite": granularite,
+                "rows": n_rows,
+                "errors": n_errors,
+                "detected": agg.detected_cols,
+                "data": rows,
+                "totals": totals,
+                "cached_at": time.time(),
+            })
 
         except Exception as e:
             traceback.print_exc()
@@ -900,6 +1021,322 @@ async def comparer_totaux(request: Request):
                             "rapport": mix_r, "ecart": ec(mix_csv[cl], mix_r)})
 
     return {"tableau": tableau, "colonnes_rapport": list(df_r.columns)}
+
+
+# ─────────────────────────────────────────────────────────────────
+#  CONTRÔLE RECETTE POST PAID
+# ─────────────────────────────────────────────────────────────────
+
+# Colonnes plaque dans les données péage
+PLAQUE_PEAGE_COLS = (
+    'Immatriculation', 'NumImmatriculation', 'NumeroImmatriculation',
+    'ImmatriculationVehicule', 'Immat', 'Plaque', 'NumPlaque',
+    'NumeroDePlaque', 'PlaqueMineralogique', 'VehicleRegistration',
+    'Registration', 'ImmatVehicule', 'Matricule', 'NumMatricule',
+    'NumeroVehicule', 'VehicleID',
+)
+
+# Colonnes plaque dans les factures post-paid
+PLAQUE_FACT_COLS = PLAQUE_PEAGE_COLS + ('Vehicule', 'Vehicle', 'Numero', 'NumVehicule')
+
+# Colonnes passages dans les factures
+PASSAGES_FACT_COLS = (
+    'NombrePassages', 'Nb_Passages', 'NbPassages', 'Passages', 'NombreVoyages',
+    'Quantite', 'Qte', 'Qty', 'Nombre', 'NbTransactions', 'NbTx',
+    'NombreTransactions', 'Transactions', 'Passage', 'Count',
+)
+
+# Colonnes montant dans les factures
+MONTANT_FACT_COLS = (
+    'Montant', 'MontantTTC', 'MontantHT', 'Total', 'TotalPaye', 'TotalTTC',
+    'MontantTotal', 'Somme', 'MontantFacture', 'Recette', 'Prix',
+    'Amount', 'AmountTotal', 'MontantDu', 'Net',
+)
+
+# Colonnes client/société dans les factures
+CLIENT_FACT_COLS = (
+    'NomClient', 'Client', 'Societe', 'Société', 'Entreprise',
+    'RaisonSociale', 'Raison_Sociale', 'Nom', 'NomSociete', 'NomEntreprise',
+    'ClientName', 'Company',
+)
+
+# Colonnes péage/gare dans les données péage
+GARE_PEAGE_COLS = (
+    'NomGareSortie', 'NomGareEntree', 'Gare', 'Station', 'GarePeage',
+    'NomGare', 'LibelleGare', 'Peage',
+)
+
+
+def _norm(s: str) -> str:
+    """Normalise un header pour matching."""
+    if s is None:
+        return ""
+    s = str(s).strip().lower()
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = re.sub(r"[^a-z0-9]+", "", s)
+    return s
+
+
+def _pick_col(headers: list, *candidates) -> str | None:
+    """Retourne le premier header qui matche un des candidats (exact puis substring)."""
+    norm_map = {_norm(h): h for h in headers if h}
+    needles = [_norm(c) for c in candidates if c]
+    for nd in needles:
+        if nd in norm_map:
+            return norm_map[nd]
+    for nd in needles:
+        for hk, horig in norm_map.items():
+            if nd and (nd in hk or hk in nd):
+                return horig
+    return None
+
+
+def _safe_float(v) -> float:
+    try:
+        return float(str(v).replace(',', '.').replace(' ', '').replace('\xa0', ''))
+    except Exception:
+        return 0.0
+
+
+def _safe_int(v) -> int:
+    try:
+        return int(round(_safe_float(v)))
+    except Exception:
+        return 0
+
+
+def _read_file_to_df(content: bytes, filename: str) -> pd.DataFrame:
+    """Lit un fichier xlsx/xls/csv et retourne un DataFrame."""
+    ext = os.path.splitext(filename)[1].lower()
+    if ext in ('.xlsx', '.xlsm'):
+        return pd.read_excel(io.BytesIO(content), engine='openpyxl')
+    elif ext == '.xls':
+        return pd.read_excel(io.BytesIO(content), engine='xlrd')
+    elif ext == '.csv':
+        return pd.read_csv(io.BytesIO(content), sep=None, engine='python')
+    else:
+        raise ValueError(f"Format non supporté : {ext}")
+
+
+def _find_header_row(df_raw: pd.DataFrame, plate_candidates: tuple) -> pd.DataFrame:
+    """
+    Cherche la ligne d'en-tête réelle dans un DataFrame brut (cas factures Excel avec
+    des lignes de titre avant le tableau). Retourne un DataFrame avec les bons headers.
+    """
+    norm_cands = [_norm(c) for c in plate_candidates]
+    for i, row in df_raw.iterrows():
+        vals = [_norm(str(v)) for v in row.values if v is not None and str(v).strip()]
+        if any(nd in v or v in nd for nd in norm_cands for v in vals if nd and v):
+            # Cette ligne est probablement l'en-tête
+            new_df = df_raw.iloc[i + 1:].copy()
+            new_df.columns = [str(c).strip() if c is not None else f'_col{j}'
+                              for j, c in enumerate(df_raw.iloc[i].values)]
+            new_df = new_df.reset_index(drop=True)
+            return new_df
+    # Pas trouvé: retourner tel quel
+    df_raw.columns = [str(c).strip() for c in df_raw.columns]
+    return df_raw
+
+
+def _parse_facture_file(content: bytes, filename: str) -> list[dict]:
+    """
+    Parse un fichier de facture post-paid.
+    Retourne une liste de {client, plaque, passages_factures, montant_facture, gare}.
+    """
+    ext = os.path.splitext(filename)[1].lower()
+    client_from_filename = os.path.splitext(os.path.basename(filename))[0]
+    # Retirer le mois/année du nom de fichier pour obtenir le nom du client
+    client_from_filename = re.sub(r'\s*(jan|fev|mar|avr|mai|juin|juil|aout|sep|oct|nov|dec|janvier|'
+                                  r'fevrier|mars|avril|mai|juin|juillet|aout|septembre|octobre|'
+                                  r'novembre|decembre)\.?\s*\d*', '',
+                                  client_from_filename, flags=re.IGNORECASE).strip()
+    client_from_filename = re.sub(r'\s*\d{4}\s*', '', client_from_filename).strip()
+    client_from_filename = client_from_filename or os.path.splitext(os.path.basename(filename))[0]
+
+    if ext in ('.xlsx', '.xlsm'):
+        df_raw = pd.read_excel(io.BytesIO(content), engine='openpyxl', header=None)
+    elif ext == '.xls':
+        df_raw = pd.read_excel(io.BytesIO(content), engine='xlrd', header=None)
+    elif ext == '.csv':
+        df_raw = pd.read_csv(io.BytesIO(content), sep=None, engine='python', header=None)
+    else:
+        raise ValueError(f"Format non supporté : {ext}")
+
+    df = _find_header_row(df_raw, PLAQUE_FACT_COLS + PASSAGES_FACT_COLS)
+
+    col_plaque    = _pick_col(list(df.columns), *PLAQUE_FACT_COLS)
+    col_passages  = _pick_col(list(df.columns), *PASSAGES_FACT_COLS)
+    col_montant   = _pick_col(list(df.columns), *MONTANT_FACT_COLS)
+    col_client    = _pick_col(list(df.columns), *CLIENT_FACT_COLS)
+    col_gare      = _pick_col(list(df.columns), *GARE_PEAGE_COLS)
+
+    rows = []
+    for _, row in df.iterrows():
+        plaque_val = str(row.get(col_plaque, '')).strip() if col_plaque else ''
+        if not plaque_val or plaque_val.lower() in ('nan', 'none', '', 'total', 'sous-total'):
+            continue
+        # Ignorer les lignes de total/sous-total
+        if re.match(r'^(total|sous[-\s]total|grand total|sous total)$', plaque_val, re.IGNORECASE):
+            continue
+
+        client_val   = str(row.get(col_client, '')).strip() if col_client else ''
+        passages_val = _safe_int(row.get(col_passages, 1)) if col_passages else 1
+        montant_val  = _safe_float(row.get(col_montant, 0)) if col_montant else 0.0
+        gare_val     = str(row.get(col_gare, '')).strip() if col_gare else ''
+
+        # Si pas de colonne client dédiée, utiliser le nom du fichier
+        client_final = client_val if client_val and client_val.lower() not in ('nan', 'none') \
+                       else client_from_filename
+
+        rows.append({
+            'client':            client_final,
+            'plaque':            plaque_val.upper(),
+            'passages_factures': passages_val,
+            'montant_facture':   montant_val,
+            'gare':              gare_val,
+        })
+    return rows
+
+
+def _extract_passages_peage(content: bytes, filename: str) -> dict[str, list]:
+    """
+    Lit un fichier péage et retourne un dict {plaque_upper: [gare1, gare2, ...]}.
+    Chaque élément de la liste est la gare de passage (ou '' si inconnue).
+    """
+    ext = os.path.splitext(filename)[1].lower()
+    if ext in ('.xlsx', '.xlsm'):
+        df = pd.read_excel(io.BytesIO(content), engine='openpyxl')
+    elif ext == '.xls':
+        df = pd.read_excel(io.BytesIO(content), engine='xlrd')
+    elif ext == '.csv':
+        df = pd.read_csv(io.BytesIO(content), sep=None, engine='python')
+    else:
+        raise ValueError(f"Format non supporté : {ext}")
+
+    df.columns = [str(c).strip() for c in df.columns]
+    col_plaque = _pick_col(list(df.columns), *PLAQUE_PEAGE_COLS)
+    col_gare   = _pick_col(list(df.columns), *GARE_PEAGE_COLS)
+
+    passages: dict[str, list] = {}
+    if col_plaque is None:
+        return passages
+
+    for _, row in df.iterrows():
+        plaque = str(row.get(col_plaque, '')).strip().upper()
+        if not plaque or plaque in ('NAN', 'NONE', ''):
+            continue
+        gare = str(row.get(col_gare, '')).strip() if col_gare else ''
+        if plaque not in passages:
+            passages[plaque] = []
+        passages[plaque].append(gare)
+
+    return passages
+
+
+@app.post("/controle-postpaid")
+async def controle_postpaid(
+    fichiers_peage:    list[UploadFile] = File(...),
+    fichiers_factures: list[UploadFile] = File(...),
+):
+    """
+    Contrôle Recette Post Paid.
+    Compare les passages réels (données péage) avec les passages facturés
+    pour chaque plaque d'immatriculation.
+    """
+    async def generate():
+        try:
+            # ── 1. Lecture des données péage ──────────────────────────────
+            yield f"data: {json.dumps({'type': 'info', 'message': 'Lecture des données péage…'})}\n\n"
+
+            passages_peage: dict[str, list] = {}  # plaque → [gare, ...]
+            peage_col_found = False
+
+            for f in fichiers_peage:
+                nom = f.filename
+                try:
+                    content = await f.read()
+                    partial = _extract_passages_peage(content, nom)
+                    if partial:
+                        peage_col_found = True
+                    for plaque, gares in partial.items():
+                        if plaque not in passages_peage:
+                            passages_peage[plaque] = []
+                        passages_peage[plaque].extend(gares)
+                    yield f"data: {json.dumps({'type': 'progress', 'message': f'{nom} : {len(partial)} plaques trouvées'})}\n\n"
+                except Exception as e:
+                    yield f"data: {json.dumps({'type': 'warning', 'message': f'Erreur lecture {nom}: {e}'})}\n\n"
+
+            if not peage_col_found:
+                yield f"data: {json.dumps({'type': 'warning', 'message': 'Colonne plaque non détectée dans les données péage. Seul le rapprochement par facture sera affiché.'})}\n\n"
+
+            total_plaques_peage = len(passages_peage)
+            yield f"data: {json.dumps({'type': 'info', 'message': f'Données péage : {total_plaques_peage} plaques distinctes chargées'})}\n\n"
+
+            # ── 2. Lecture des factures post-paid ─────────────────────────
+            yield f"data: {json.dumps({'type': 'info', 'message': 'Lecture des factures post-paid…'})}\n\n"
+
+            lignes_factures: list[dict] = []
+            for f in fichiers_factures:
+                nom = f.filename
+                try:
+                    content = await f.read()
+                    lignes = _parse_facture_file(content, nom)
+                    lignes_factures.extend(lignes)
+                    yield f"data: {json.dumps({'type': 'progress', 'message': f'{nom} : {len(lignes)} lignes facturées'})}\n\n"
+                except Exception as e:
+                    yield f"data: {json.dumps({'type': 'warning', 'message': f'Erreur lecture facture {nom}: {e}'})}\n\n"
+
+            if not lignes_factures:
+                yield f"data: {json.dumps({'type': 'erreur', 'message': 'Aucune ligne de facture valide trouvée.'})}\n\n"
+                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                return
+
+            # ── 3. Rapprochement ──────────────────────────────────────────
+            yield f"data: {json.dumps({'type': 'info', 'message': 'Rapprochement en cours…'})}\n\n"
+
+            resultats = []
+            for ligne in lignes_factures:
+                plaque = ligne['plaque']
+                passages_reel = len(passages_peage.get(plaque, []))
+                passages_fact = ligne['passages_factures']
+                ecart         = passages_fact - passages_reel
+                gares_reel    = list(set(passages_peage.get(plaque, [])))
+
+                resultats.append({
+                    'client':            ligne['client'],
+                    'plaque':            plaque,
+                    'gare_facture':      ligne['gare'],
+                    'passages_factures': passages_fact,
+                    'passages_peage':    passages_reel,
+                    'ecart':             ecart,
+                    'montant_facture':   ligne['montant_facture'],
+                    'gares_peage':       ', '.join(g for g in gares_reel if g) or '—',
+                    'statut': 'ok' if ecart == 0 else ('surfacture' if ecart > 0 else 'sousfacture'),
+                })
+
+            # Totaux
+            totaux = {
+                'total_lignes':         len(resultats),
+                'total_passages_fact':  sum(r['passages_factures'] for r in resultats),
+                'total_passages_peage': sum(r['passages_peage']    for r in resultats),
+                'total_ecart':          sum(r['ecart']             for r in resultats),
+                'total_montant':        sum(r['montant_facture']   for r in resultats),
+                'nb_ok':                sum(1 for r in resultats if r['statut'] == 'ok'),
+                'nb_surfacture':        sum(1 for r in resultats if r['statut'] == 'surfacture'),
+                'nb_sousfacture':       sum(1 for r in resultats if r['statut'] == 'sousfacture'),
+            }
+
+            yield f"data: {json.dumps({'type': 'resultat', 'data': resultats, 'totaux': totaux})}\n\n"
+
+        except Exception as e:
+            traceback.print_exc()
+            yield f"data: {json.dumps({'type': 'erreur', 'message': str(e)})}\n\n"
+
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 if __name__ == "__main__":

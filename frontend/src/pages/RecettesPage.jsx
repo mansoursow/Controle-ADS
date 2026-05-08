@@ -13,7 +13,26 @@ const TOTAL_KEYS = [
 // Extrait le nom de gare depuis le nom de fichier (ex: "Nguekhokh-2021.csv" → "Nguekhokh")
 const extractStation = (filename) => {
   const base = filename.replace(/\.(csv|xlsx|xls)$/i, '');
-  return base.replace(/[-_\s]?\d{4}[-_\s]?/g, '').replace(/[-_\s]+$/, '').trim() || base;
+  const cleaned = base
+    .replace(/[-_\s]?\d{4}[-_\s]?/g, '') // retire les années dans le nom de fichier
+    .replace(/[-_\s]+$/, '')
+    .trim();
+  // Retire des préfixes fréquents: "BPV Kirene", "BVP Thies", etc.
+  return cleaned
+    .replace(/^(bpv|bvp|gsb|gdp)\s+/i, '')
+    .replace(/^gare(\s+de\s+peage|\s+de\s+péage)?\s+/i, '')
+    .replace(/\s+/g, ' ')
+    .trim() || base;
+};
+
+const normalizeStationKey = (name) => {
+  const s = String(name || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '') // supprime accents
+    .replace(/[^\p{L}\p{N}]+/gu, '') // supprime espaces/ponctuation
+    .toLowerCase()
+    .trim();
+  return s;
 };
 
 const computeTotals = (data) => {
@@ -148,7 +167,7 @@ export default function RecettesPage({ onBack }) {
   const [fichiers, setFichiers]       = useState([]);
   const [granularite, setGranularite] = useState('mois');
   const [analysing, setAnalysing]     = useState(false);
-  const [allResults, setAllResults]   = useState([]); // [{station, filename, data, totals}]
+  const [allResults, setAllResults]   = useState([]); // [{stationKey, stationLabel, filename, data, totals}]
   const [logs, setLogs]               = useState([]);
 
   // Filtres
@@ -195,7 +214,20 @@ export default function RecettesPage({ onBack }) {
 
   // ── Options de filtre dérivées des données ──
   const filterOptions = useMemo(() => {
-    const gares  = [...new Set(allResults.map(r => r.station))].sort();
+    const byKey = new Map();
+    for (const r of allResults) {
+      if (!r.stationKey) continue;
+      if (!byKey.has(r.stationKey)) byKey.set(r.stationKey, r.stationLabel || r.stationKey);
+      // Préfère un libellé plus "propre" (le plus court) si on reçoit plusieurs variantes
+      else {
+        const cur = byKey.get(r.stationKey);
+        const nxt = r.stationLabel || cur;
+        if (String(nxt).length < String(cur).length) byKey.set(r.stationKey, nxt);
+      }
+    }
+    const gares = [...byKey.entries()]
+      .map(([key, label]) => ({ key, label }))
+      .sort((a, b) => a.label.localeCompare(b.label, 'fr', { sensitivity: 'base' }));
     const annees = [...new Set(
       allResults.flatMap(r => r.data.map(d => d.periode.split('-')[0]))
     )].sort();
@@ -205,7 +237,7 @@ export default function RecettesPage({ onBack }) {
         .filter(Boolean)
       )
     )].sort();
-    return { gares, annees, mois };
+    return { gares, annees, mois, labelByKey: byKey };
   }, [allResults]);
 
   // ── Vue filtrée (re-agrégation à la volée) ──
@@ -214,7 +246,7 @@ export default function RecettesPage({ onBack }) {
 
     let filtered = allResults;
     if (filterGare !== 'all')
-      filtered = filtered.filter(r => r.station === filterGare);
+      filtered = filtered.filter(r => r.stationKey === filterGare);
 
     let data = filtered.flatMap(r => r.data);
 
@@ -316,8 +348,9 @@ export default function RecettesPage({ onBack }) {
         try {
           const partial = await processOne(fich, abortRef.current.signal);
           if (partial) {
-            const station = extractStation(fich.name);
-            setAllResults(prev => [...prev, { station, filename: fich.name, ...partial }]);
+            const stationLabel = extractStation(fich.name);
+            const stationKey   = normalizeStationKey(stationLabel);
+            setAllResults(prev => [...prev, { stationKey, stationLabel, filename: fich.name, ...partial }]);
           }
         } catch (e) {
           if (e.name === 'AbortError') throw e;
@@ -457,7 +490,9 @@ export default function RecettesPage({ onBack }) {
                   <select value={filterGare} onChange={e => setFilterGare(e.target.value)}
                     className="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm text-slate-700 focus:outline-none focus:border-emerald-400 bg-white">
                     <option value="all">Toutes les gares</option>
-                    {filterOptions.gares.map(g => <option key={g} value={g}>{g}</option>)}
+                    {filterOptions.gares.map(({ key, label }) => (
+                      <option key={key} value={key}>{label}</option>
+                    ))}
                   </select>
                 </div>
 
@@ -501,7 +536,11 @@ export default function RecettesPage({ onBack }) {
               {(filterGare !== 'all' || filterAnnee !== 'all' || filterMois !== 'all') && (
                 <div className="mt-4 flex items-center gap-3 flex-wrap">
                   <span className="text-xs text-slate-500 font-bold uppercase">Filtre actif :</span>
-                  {filterGare  !== 'all' && <span className="bg-emerald-100 text-emerald-700 text-xs font-bold px-3 py-1 rounded-full">🏢 {filterGare}</span>}
+                  {filterGare  !== 'all' && (
+                    <span className="bg-emerald-100 text-emerald-700 text-xs font-bold px-3 py-1 rounded-full">
+                      🏢 {filterOptions.labelByKey?.get(filterGare) || filterGare}
+                    </span>
+                  )}
                   {filterAnnee !== 'all' && <span className="bg-emerald-100 text-emerald-700 text-xs font-bold px-3 py-1 rounded-full">📅 {filterAnnee}</span>}
                   {filterMois  !== 'all' && <span className="bg-blue-100 text-blue-700 text-xs font-bold px-3 py-1 rounded-full">🗓 Mois {filterMois}</span>}
                   <button onClick={() => { setFilterGare('all'); setFilterAnnee('all'); setFilterMois('all'); }}
@@ -569,7 +608,7 @@ export default function RecettesPage({ onBack }) {
               <div className="bg-slate-800 px-6 py-3 flex items-center justify-between">
                 <h2 className="text-white font-black text-sm uppercase tracking-wider">
                   Recettes {GRAN_LABELS[granularite]}
-                  {filterGare  !== 'all'  && ` · ${filterGare}`}
+                  {filterGare  !== 'all'  && ` · ${(filterOptions.labelByKey?.get(filterGare) || filterGare)}`}
                   {filterAnnee !== 'all'  && ` · ${filterAnnee}`}
                   {filterMois  !== 'all'  && ` · Mois ${filterMois}`}
                 </h2>
