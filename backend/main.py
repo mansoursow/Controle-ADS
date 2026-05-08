@@ -1234,6 +1234,20 @@ def _extract_passages_peage(content: bytes, filename: str) -> dict[str, list]:
     return passages
 
 
+def _pp_cache_key_peage(content: bytes) -> str:
+    h = hashlib.sha256()
+    h.update(b"postpaid-peage|v1|")
+    h.update(content)
+    return h.hexdigest()
+
+
+def _pp_cache_key_facture(content: bytes) -> str:
+    h = hashlib.sha256()
+    h.update(b"postpaid-facture|v1|")
+    h.update(content)
+    return h.hexdigest()
+
+
 @app.post("/controle-postpaid")
 async def controle_postpaid(
     fichiers_peage:    list[UploadFile] = File(...),
@@ -1243,49 +1257,86 @@ async def controle_postpaid(
     Contrôle Recette Post Paid.
     Compare les passages réels (données péage) avec les passages facturés
     pour chaque plaque d'immatriculation.
+    Cache SHA256 par fichier pour éviter de re-parser les fichiers déjà connus.
     """
     async def generate():
         try:
-            # ── 1. Lecture des données péage ──────────────────────────────
-            yield f"data: {json.dumps({'type': 'info', 'message': 'Lecture des données péage…'})}\n\n"
+            total_steps = len(fichiers_peage) + len(fichiers_factures) + 1  # +1 rapprochement
+            step = 0
 
-            passages_peage: dict[str, list] = {}  # plaque → [gare, ...]
+            def pct(extra=0):
+                return min(99, int((step + extra) / total_steps * 95))
+
+            def evt_pbar(p, msg=""):
+                return f"data: {json.dumps({'type': 'progress_bar', 'pct': p, 'message': msg})}\n\n"
+
+            yield evt_pbar(0, "Démarrage…")
+
+            # ── 1. Lecture des données péage ──────────────────────────────
+            yield f"data: {json.dumps({'type': 'info', 'message': f'Lecture des données péage ({len(fichiers_peage)} fichier(s))…'})}\n\n"
+
+            passages_peage: dict[str, list] = {}
             peage_col_found = False
 
             for f in fichiers_peage:
                 nom = f.filename
                 try:
                     content = await f.read()
-                    partial = _extract_passages_peage(content, nom)
+                    key = _pp_cache_key_peage(content)
+                    cached = _cache_get(key)
+
+                    if cached is not None:
+                        partial = {p: v for p, v in cached.get('plaques', {}).items()}
+                        yield f"data: {json.dumps({'type': 'progress', 'message': f'⚡ {nom} (cache) : {len(partial)} plaques'})}\n\n"
+                    else:
+                        partial = _extract_passages_peage(content, nom)
+                        _cache_set(key, {'plaques': partial})
+                        yield f"data: {json.dumps({'type': 'progress', 'message': f'{nom} : {len(partial)} plaques trouvées'})}\n\n"
+
                     if partial:
                         peage_col_found = True
                     for plaque, gares in partial.items():
                         if plaque not in passages_peage:
                             passages_peage[plaque] = []
                         passages_peage[plaque].extend(gares)
-                    yield f"data: {json.dumps({'type': 'progress', 'message': f'{nom} : {len(partial)} plaques trouvées'})}\n\n"
+
                 except Exception as e:
                     yield f"data: {json.dumps({'type': 'warning', 'message': f'Erreur lecture {nom}: {e}'})}\n\n"
 
-            if not peage_col_found:
-                yield f"data: {json.dumps({'type': 'warning', 'message': 'Colonne plaque non détectée dans les données péage. Seul le rapprochement par facture sera affiché.'})}\n\n"
+                step += 1
+                yield evt_pbar(pct(), nom)
 
-            total_plaques_peage = len(passages_peage)
-            yield f"data: {json.dumps({'type': 'info', 'message': f'Données péage : {total_plaques_peage} plaques distinctes chargées'})}\n\n"
+            if not peage_col_found:
+                yield f"data: {json.dumps({'type': 'warning', 'message': 'Colonne plaque non détectée dans les données péage.'})}\n\n"
+
+            yield f"data: {json.dumps({'type': 'info', 'message': f'Péage : {len(passages_peage)} plaques distinctes chargées'})}\n\n"
 
             # ── 2. Lecture des factures post-paid ─────────────────────────
-            yield f"data: {json.dumps({'type': 'info', 'message': 'Lecture des factures post-paid…'})}\n\n"
+            yield f"data: {json.dumps({'type': 'info', 'message': f'Lecture des factures ({len(fichiers_factures)} fichier(s))…'})}\n\n"
 
             lignes_factures: list[dict] = []
             for f in fichiers_factures:
                 nom = f.filename
                 try:
                     content = await f.read()
-                    lignes = _parse_facture_file(content, nom)
+                    key = _pp_cache_key_facture(content)
+                    cached = _cache_get(key)
+
+                    if cached is not None:
+                        lignes = cached.get('rows', [])
+                        yield f"data: {json.dumps({'type': 'progress', 'message': f'⚡ {nom} (cache) : {len(lignes)} lignes'})}\n\n"
+                    else:
+                        lignes = _parse_facture_file(content, nom)
+                        _cache_set(key, {'rows': lignes})
+                        yield f"data: {json.dumps({'type': 'progress', 'message': f'{nom} : {len(lignes)} lignes facturées'})}\n\n"
+
                     lignes_factures.extend(lignes)
-                    yield f"data: {json.dumps({'type': 'progress', 'message': f'{nom} : {len(lignes)} lignes facturées'})}\n\n"
+
                 except Exception as e:
                     yield f"data: {json.dumps({'type': 'warning', 'message': f'Erreur lecture facture {nom}: {e}'})}\n\n"
+
+                step += 1
+                yield evt_pbar(pct(), nom)
 
             if not lignes_factures:
                 yield f"data: {json.dumps({'type': 'erreur', 'message': 'Aucune ligne de facture valide trouvée.'})}\n\n"
@@ -1293,7 +1344,8 @@ async def controle_postpaid(
                 return
 
             # ── 3. Rapprochement ──────────────────────────────────────────
-            yield f"data: {json.dumps({'type': 'info', 'message': 'Rapprochement en cours…'})}\n\n"
+            yield evt_pbar(97, "Rapprochement…")
+            yield f"data: {json.dumps({'type': 'info', 'message': f'Rapprochement de {len(lignes_factures)} lignes…'})}\n\n"
 
             resultats = []
             for ligne in lignes_factures:
@@ -1315,7 +1367,6 @@ async def controle_postpaid(
                     'statut': 'ok' if ecart == 0 else ('surfacture' if ecart > 0 else 'sousfacture'),
                 })
 
-            # Totaux
             totaux = {
                 'total_lignes':         len(resultats),
                 'total_passages_fact':  sum(r['passages_factures'] for r in resultats),
@@ -1327,6 +1378,7 @@ async def controle_postpaid(
                 'nb_sousfacture':       sum(1 for r in resultats if r['statut'] == 'sousfacture'),
             }
 
+            yield evt_pbar(100, "Terminé")
             yield f"data: {json.dumps({'type': 'resultat', 'data': resultats, 'totaux': totaux})}\n\n"
 
         except Exception as e:

@@ -128,6 +128,8 @@ export default function PostPaidPage({ onBack }) {
   const [fichiersPeage,    setFichiersPeage]    = useState([]);
   const [fichiersFactures, setFichiersFactures] = useState([]);
   const [loading,    setLoading]    = useState(false);
+  const [progress,   setProgress]   = useState(0);
+  const [progLabel,  setProgLabel]  = useState('');
   const [logs,       setLogs]       = useState([]);
   const [resultats,  setResultats]  = useState([]);
   const [totaux,     setTotaux]     = useState(null);
@@ -142,6 +144,8 @@ export default function PostPaidPage({ onBack }) {
   const lancer = async () => {
     if (!fichiersPeage.length || !fichiersFactures.length) return;
     setLoading(true);
+    setProgress(0);
+    setProgLabel('Démarrage…');
     setLogs([]);
     setResultats([]);
     setTotaux(null);
@@ -172,10 +176,14 @@ export default function PostPaidPage({ onBack }) {
           if (!line) continue;
           try {
             const evt = JSON.parse(line);
-            if (evt.type === 'info')     addLog(evt.message, 'info');
-            if (evt.type === 'progress') addLog(evt.message, 'progress');
-            if (evt.type === 'warning')  addLog(evt.message, 'warning');
-            if (evt.type === 'erreur')   addLog(evt.message, 'error');
+            if (evt.type === 'info')         addLog(evt.message, 'info');
+            if (evt.type === 'progress')     addLog(evt.message, 'progress');
+            if (evt.type === 'warning')      addLog(evt.message, 'warning');
+            if (evt.type === 'erreur')       addLog(evt.message, 'error');
+            if (evt.type === 'progress_bar') {
+              setProgress(evt.pct);
+              if (evt.message) setProgLabel(evt.message);
+            }
             if (evt.type === 'resultat') {
               setResultats(evt.data || []);
               setTotaux(evt.totaux || null);
@@ -277,6 +285,28 @@ export default function PostPaidPage({ onBack }) {
             </button>
           )}
         </div>
+
+        {/* Barre de progression */}
+        {(loading || progress > 0) && (
+          <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-5">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-sm font-semibold text-slate-700 truncate max-w-[80%]">
+                {progLabel || 'Traitement en cours…'}
+              </span>
+              <span className={`text-sm font-extrabold tabular-nums ${progress === 100 ? 'text-emerald-600' : 'text-violet-600'}`}>
+                {progress}%
+              </span>
+            </div>
+            <div className="h-3 bg-slate-100 rounded-full overflow-hidden">
+              <div
+                className={`h-full rounded-full transition-all duration-300 ${
+                  progress === 100 ? 'bg-emerald-500' : 'bg-violet-500'
+                }`}
+                style={{ width: `${progress}%` }}
+              />
+            </div>
+          </div>
+        )}
 
         {/* Logs */}
         {logs.length > 0 && (
