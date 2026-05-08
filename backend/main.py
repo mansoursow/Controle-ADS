@@ -1029,6 +1029,7 @@ async def comparer_totaux(request: Request):
 
 # Colonnes plaque dans les données péage
 PLAQUE_PEAGE_COLS = (
+    'PlaqueLPR_Entree', 'PlaqueLPR_Sortie', 'PlaqueLPR',
     'Immatriculation', 'NumImmatriculation', 'NumeroImmatriculation',
     'ImmatriculationVehicule', 'Immat', 'Plaque', 'NumPlaque',
     'NumeroDePlaque', 'PlaqueMineralogique', 'VehicleRegistration',
@@ -1215,8 +1216,18 @@ def _extract_passages_peage(content: bytes, filename: str) -> dict[str, list]:
         raise ValueError(f"Format non supporté : {ext}")
 
     df.columns = [str(c).strip() for c in df.columns]
-    col_plaque = _pick_col(list(df.columns), *PLAQUE_PEAGE_COLS)
-    col_gare   = _pick_col(list(df.columns), *GARE_PEAGE_COLS)
+    cols = list(df.columns)
+    col_plaque = _pick_col(cols, *PLAQUE_PEAGE_COLS)
+    col_gare   = _pick_col(cols, *GARE_PEAGE_COLS)
+
+    # Colonne secondaire pour les CSV à double champ LPR (entrée + sortie)
+    col_plaque2 = None
+    if col_plaque == 'PlaqueLPR_Entree' and 'PlaqueLPR_Sortie' in df.columns:
+        col_plaque2 = 'PlaqueLPR_Sortie'
+    elif col_plaque == 'PlaqueLPR_Sortie' and 'PlaqueLPR_Entree' in df.columns:
+        col_plaque2 = 'PlaqueLPR_Entree'
+
+    SKIP = {'NAN', 'NONE', '', 'NO PLAQUES', 'NOPLAQUES', 'NOPLAQUE', '-', 'N/A', 'NA'}
 
     passages: dict[str, list] = {}
     if col_plaque is None:
@@ -1224,7 +1235,9 @@ def _extract_passages_peage(content: bytes, filename: str) -> dict[str, list]:
 
     for _, row in df.iterrows():
         plaque = str(row.get(col_plaque, '')).strip().upper()
-        if not plaque or plaque in ('NAN', 'NONE', ''):
+        if plaque in SKIP and col_plaque2:
+            plaque = str(row.get(col_plaque2, '')).strip().upper()
+        if not plaque or plaque in SKIP:
             continue
         gare = str(row.get(col_gare, '')).strip() if col_gare else ''
         if plaque not in passages:
@@ -1290,20 +1303,23 @@ async def read_plaques_endpoint(request: Request):
 async def count_peage_file(request: Request):
     """
     Compte les passages par plaque dans UN seul fichier péage.
-    Envoi fichier par fichier depuis le frontend (évite les gros uploads multipart).
+    Le body est lu AVANT de démarrer le StreamingResponse pour éviter
+    les MultipartParseError liés au boundary.
     Cache SHA256 — deuxième upload du même fichier = réponse instantanée.
     """
+    try:
+        form = await request.form(max_files=1, max_fields=10)
+        fichier = form.get("fichier_peage")
+        if not fichier:
+            return JSONResponse({"error": "Fichier manquant"}, status_code=400)
+        nom = fichier.filename
+        content = await fichier.read()
+    except Exception as e:
+        traceback.print_exc()
+        return JSONResponse({"error": f"Lecture du fichier impossible : {e}"}, status_code=400)
+
     async def generate():
         try:
-            form = await request.form(max_files=1, max_fields=10)
-            fichier = form.get("fichier_peage")
-            if not fichier:
-                yield f"data: {json.dumps({'type': 'erreur', 'message': 'Fichier manquant'})}\n\n"
-                yield f"data: {json.dumps({'type': 'done'})}\n\n"
-                return
-
-            nom = fichier.filename
-            content = await fichier.read()
             key = _pp_cache_key_peage(content)
             cached = _cache_get(key)
 
@@ -1316,7 +1332,6 @@ async def count_peage_file(request: Request):
                 _cache_set(key, {'plaques': passages})
                 yield f"data: {json.dumps({'type': 'progress', 'message': f'{nom} : {len(passages)} plaques trouvées'})}\n\n"
 
-            # Retourner le comptage : {plaque: nb_passages}
             counts = {p: len(gares) for p, gares in passages.items()}
             yield f"data: {json.dumps({'type': 'resultat', 'counts': counts, 'fichier': nom})}\n\n"
 
