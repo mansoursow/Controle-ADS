@@ -1072,6 +1072,28 @@ TARIF_PEAGE_COLS = ('TotalPaye', 'Total', 'Montant', 'TotalTTC', 'Tarif', 'Prix'
 DATE_PEAGE_COLS  = ('DateHeureSortie', 'DateHeureEntree', 'DateHeure', 'DateSortie', 'DateEntree', 'Date', 'DatePassage')
 CLASSE_PEAGE_COLS = ('ClasseFacturee', 'ClasseDetectee_Entree', 'ClasseDetectee', 'Classe', 'Category', 'TypeVehicule', 'Categorie')
 
+# Colonnes facture post-paid
+MOIS_FACT_COLS   = ('Mois', 'Month', 'Periode', 'Mois_facturation', 'MoisFacturation')
+PLAQUE_FACT2_COLS = ('Plaques', 'Plaque') + PLAQUE_PEAGE_COLS
+CLIENT_FACT2_COLS = ('Nom du client', 'NomClient', 'Client', 'Societe', 'NomSociete', 'Entreprise', 'RaisonSociale')
+MONTANT_FACT2_COLS = ('Montant total', 'MontantTotal', 'Montant', 'Total', 'TotalPaye', 'TotalTTC')
+
+# Mapping mois français → numéro
+_FR_MOIS: dict = {
+    'jan': 1, 'janv': 1, 'janvier': 1,
+    'fev': 2, 'fevr': 2, 'fevrier': 2,
+    'mar': 3, 'mars': 3,
+    'avr': 4, 'avril': 4,
+    'mai': 5,
+    'jun': 6, 'juin': 6,
+    'jul': 7, 'juil': 7, 'juillet': 7,
+    'aou': 8, 'aout': 8,
+    'sep': 9, 'sept': 9, 'septembre': 9,
+    'oct': 10, 'octobre': 10,
+    'nov': 11, 'novembre': 11,
+    'dec': 12, 'decembre': 12,
+}
+
 
 def _norm(s: str) -> str:
     """Normalise un header pour matching."""
@@ -1082,6 +1104,51 @@ def _norm(s: str) -> str:
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
     s = re.sub(r"[^a-z0-9]+", "", s)
     return s
+
+
+def _normalize_plaque(p: str) -> str:
+    """'AA 768 BC' → 'AA768BC', 'SL-6495-B' → 'SL6495B', 'A/B' → 'A'."""
+    p = str(p).strip().upper()
+    if '/' in p:
+        p = p.split('/')[0].strip()
+    return re.sub(r'[\s\-]+', '', p)
+
+
+def _parse_mois_fr(mois_str: str) -> str:
+    """'juil-21' → '2021-07', 'août-21' → '2021-08', '' → ''."""
+    s = unicodedata.normalize('NFKD', mois_str.strip().lower())
+    s = ''.join(ch for ch in s if not unicodedata.combining(ch))
+    parts = re.split(r'[-/\s]+', s)
+    if len(parts) >= 2:
+        month = _FR_MOIS.get(parts[0])
+        if month:
+            try:
+                year = int(parts[1])
+                if year < 100:
+                    year += 2000
+                return f"{year}-{month:02d}"
+            except ValueError:
+                pass
+    m = re.match(r'^(\d{1,2})[/-](\d{4})$', s)
+    if m:
+        return f"{m.group(2)}-{int(m.group(1)):02d}"
+    m = re.match(r'^(\d{4})[/-](\d{1,2})$', s)
+    if m:
+        return f"{m.group(1)}-{int(m.group(2)):02d}"
+    return ''
+
+
+def _extract_mois_key(date_str: str) -> str:
+    """'31/12/2021 23:59' → '2021-12',  '2021-12-31 ...' → '2021-12'."""
+    if not date_str:
+        return ''
+    m = re.match(r'^(\d{1,2})/(\d{1,2})/(\d{4})', date_str)
+    if m:
+        return f"{m.group(3)}-{int(m.group(2)):02d}"
+    m = re.match(r'^(\d{4})-(\d{1,2})', date_str)
+    if m:
+        return f"{m.group(1)}-{int(m.group(2)):02d}"
+    return ''
 
 
 def _pick_col(headers: list, *candidates) -> str | None:
@@ -1297,6 +1364,65 @@ def _read_plaques_file(content: bytes, filename: str) -> list[str]:
     return plates
 
 
+@app.post("/controle-postpaid/facture")
+async def read_facture_endpoint(request: Request):
+    """
+    Lit le fichier de facturation post-paid :
+    colonnes Mois | Plaques | Nom du client | Montant total
+    Retourne une liste de lignes {mois, mois_key, plaque, plaque_key, client, montant_facture}.
+    """
+    form = await request.form(max_files=1, max_fields=10)
+    fichier = form.get("fichier_facture")
+    if not fichier:
+        return JSONResponse({"error": "Aucun fichier fourni"}, status_code=400)
+    try:
+        content = await fichier.read()
+        df = _read_file_to_df(content, fichier.filename)
+        df.columns = [str(c).strip() for c in df.columns]
+        cols = list(df.columns)
+        col_mois    = _pick_col(cols, *MOIS_FACT_COLS)
+        col_plaque  = _pick_col(cols, *PLAQUE_FACT2_COLS)
+        col_client  = _pick_col(cols, *CLIENT_FACT2_COLS)
+        col_montant = _pick_col(cols, *MONTANT_FACT2_COLS)
+
+        if col_plaque is None:
+            col_plaque = cols[1] if len(cols) > 1 else cols[0]
+
+        rows = []
+        clients = set()
+        for _, row in df.iterrows():
+            mois_str = str(row.get(col_mois, '')).strip() if col_mois else ''
+            plaque_raw = str(row.get(col_plaque, '')).strip()
+            plaque_up  = plaque_raw.upper()
+            client  = str(row.get(col_client, '')).strip()  if col_client  else ''
+            montant = _safe_float(row.get(col_montant))     if col_montant else 0.0
+
+            if not plaque_raw or plaque_up in ('NAN', 'NONE', ''):
+                continue
+
+            mois_key   = _parse_mois_fr(mois_str)
+            plaque_key = _normalize_plaque(plaque_raw)
+            rows.append({
+                'mois':           mois_str,
+                'mois_key':       mois_key,
+                'plaque':         plaque_up,
+                'plaque_key':     plaque_key,
+                'client':         client,
+                'montant_facture': montant,
+            })
+            if client:
+                clients.add(client)
+
+        return JSONResponse({
+            'rows':    rows,
+            'total':   len(rows),
+            'clients': sorted(clients),
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 @app.post("/controle-postpaid/plaques")
 async def read_plaques_endpoint(request: Request):
     """
@@ -1368,11 +1494,18 @@ async def count_peage_file(request: Request):
             for plaque, plist in passages.items():
                 counts[plaque] = len(plist)
                 if plaque in plaques_cibles:
-                    montant_total = sum(
-                        p.get('montant', 0) for p in plist
-                        if isinstance(p, dict) and p.get('montant') is not None
-                    )
-                    details[plaque] = {'montant': montant_total, 'passages': plist}
+                    # Groupe par mois (YYYY-MM) en utilisant la date de sortie
+                    by_mois: dict = {}
+                    for p in plist:
+                        if not isinstance(p, dict):
+                            continue
+                        mk = _extract_mois_key(p.get('date', ''))
+                        if mk not in by_mois:
+                            by_mois[mk] = {'montant': 0.0, 'nb': 0, 'passages': []}
+                        by_mois[mk]['montant'] += p.get('montant', 0) or 0
+                        by_mois[mk]['nb'] += 1
+                        by_mois[mk]['passages'].append(p)
+                    details[plaque] = by_mois
 
             yield f"data: {json.dumps({'type': 'resultat', 'counts': counts, 'details': details, 'fichier': nom})}\n\n"
 
