@@ -3,6 +3,7 @@ import os
 import re
 import sys
 import json
+import pickle
 import glob as glob_module
 import base64
 import time
@@ -863,6 +864,26 @@ def _cache_set(key: str, payload: dict) -> None:
     tmp.replace(p)
 
 
+def _pp_cache_get(key: str):
+    """Cache pickle pour les gros fichiers péage — 10× plus rapide que JSON."""
+    p = _cache_dir() / f"{key}.pkl"
+    if p.exists():
+        try:
+            return pickle.loads(p.read_bytes())
+        except Exception:
+            pass
+    return None
+
+
+def _pp_cache_set(key: str, payload: dict) -> None:
+    d = _cache_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / f"{key}.pkl"
+    tmp = d / f"{key}.tmp.pkl"
+    tmp.write_bytes(pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL))
+    tmp.replace(p)
+
+
 @app.post("/analyser-excel")
 async def analyser_excel(
     fichier: UploadFile = File(...),
@@ -1274,16 +1295,17 @@ def _parse_facture_file(content: bytes, filename: str) -> list[dict]:
 
 def _extract_passages_peage(content: bytes, filename: str) -> dict[str, list]:
     """
-    Lit un fichier péage et retourne un dict {plaque_upper: [passage_dict, ...]}.
-    Chaque passage_dict contient : gare_e, gare_s, date, montant, classe.
+    Lit un fichier péage et retourne {plaque_upper: [passage_dict, ...]}.
+    Entièrement vectorisé — pas d'iterrows() — pour supporter les CSV de 1M+ lignes.
     """
     ext = os.path.splitext(filename)[1].lower()
     if ext in ('.xlsx', '.xlsm'):
-        df = pd.read_excel(io.BytesIO(content), engine='openpyxl')
+        df = pd.read_excel(io.BytesIO(content), engine='openpyxl', dtype=str)
     elif ext == '.xls':
-        df = pd.read_excel(io.BytesIO(content), engine='xlrd')
+        df = pd.read_excel(io.BytesIO(content), engine='xlrd', dtype=str)
     elif ext == '.csv':
-        df = pd.read_csv(io.BytesIO(content), sep=None, engine='python')
+        df = pd.read_csv(io.BytesIO(content), sep=None, engine='python', dtype=str,
+                         on_bad_lines='skip')
     else:
         raise ValueError(f"Format non supporté : {ext}")
 
@@ -1296,45 +1318,63 @@ def _extract_passages_peage(content: bytes, filename: str) -> dict[str, list]:
     col_date    = _pick_col(cols, *DATE_PEAGE_COLS)
     col_classe  = _pick_col(cols, *CLASSE_PEAGE_COLS)
 
-    # Si pas de colonnes entrée/sortie séparées, fallback générique
     if not col_gare_e and not col_gare_s:
         col_gare_e = _pick_col(cols, *GARE_PEAGE_COLS)
 
-    # Colonne secondaire pour les CSV à double champ LPR (entrée + sortie)
-    col_plaque2 = None
-    if col_plaque == 'PlaqueLPR_Entree' and 'PlaqueLPR_Sortie' in df.columns:
-        col_plaque2 = 'PlaqueLPR_Sortie'
-    elif col_plaque == 'PlaqueLPR_Sortie' and 'PlaqueLPR_Entree' in df.columns:
-        col_plaque2 = 'PlaqueLPR_Entree'
+    if col_plaque is None:
+        return {}
 
     SKIP = {'NAN', 'NONE', '', 'NO PLAQUES', 'NOPLAQUES', 'NOPLAQUE', '-', 'N/A', 'NA'}
 
+    # ── Extraction vectorisée des plaques ────────────────────────────────────
+    ser = df[col_plaque].fillna('').str.strip().str.upper()
+
+    # Fallback colonne LPR secondaire
+    col_plaque2 = None
+    if col_plaque == 'PlaqueLPR_Entree' and 'PlaqueLPR_Sortie' in cols:
+        col_plaque2 = 'PlaqueLPR_Sortie'
+    elif col_plaque == 'PlaqueLPR_Sortie' and 'PlaqueLPR_Entree' in cols:
+        col_plaque2 = 'PlaqueLPR_Entree'
+
+    if col_plaque2:
+        ser2 = df[col_plaque2].fillna('').str.strip().str.upper()
+        bad  = ser.isin(SKIP)
+        ser  = ser.where(~bad, ser2)
+
+    mask = ~ser.isin(SKIP) & (ser.str.len() > 0)
+    df_v = df.loc[mask].copy()
+    df_v['_plaque'] = ser.loc[mask].values
+
+    if df_v.empty:
+        return {}
+
+    # ── Extraction vectorisée des autres colonnes ────────────────────────────
+    entry_cols: dict = {}
+    if col_gare_e:
+        entry_cols['gare_e'] = df_v[col_gare_e].fillna('').str.strip()
+    if col_gare_s:
+        entry_cols['gare_s'] = df_v[col_gare_s].fillna('').str.strip()
+    if col_date:
+        entry_cols['date']   = df_v[col_date].fillna('').str.strip()
+    if col_tarif:
+        entry_cols['montant'] = (
+            pd.to_numeric(
+                df_v[col_tarif].fillna('0').str.replace(',', '.', regex=False)
+                               .str.replace(r'[\s\xa0]', '', regex=True),
+                errors='coerce'
+            ).fillna(0.0)
+        )
+    if col_classe:
+        entry_cols['classe'] = df_v[col_classe].fillna('').str.strip()
+
+    extract = pd.DataFrame(entry_cols, index=df_v.index)
+    extract['_plaque'] = df_v['_plaque'].values
+    ecols = [c for c in extract.columns if c != '_plaque']
+
+    # ── Groupement par plaque (groupby rapide) ───────────────────────────────
     passages: dict[str, list] = {}
-    if col_plaque is None:
-        return passages
-
-    for _, row in df.iterrows():
-        plaque = str(row.get(col_plaque, '')).strip().upper()
-        if plaque in SKIP and col_plaque2:
-            plaque = str(row.get(col_plaque2, '')).strip().upper()
-        if not plaque or plaque in SKIP:
-            continue
-
-        entry: dict = {}
-        if col_gare_e:
-            entry['gare_e'] = str(row.get(col_gare_e, '')).strip()
-        if col_gare_s:
-            entry['gare_s'] = str(row.get(col_gare_s, '')).strip()
-        if col_date:
-            entry['date'] = str(row.get(col_date, '')).strip()
-        if col_tarif:
-            entry['montant'] = _safe_float(row.get(col_tarif))
-        if col_classe:
-            entry['classe'] = str(row.get(col_classe, '')).strip()
-
-        if plaque not in passages:
-            passages[plaque] = []
-        passages[plaque].append(entry)
+    for plaque, grp in extract.groupby('_plaque', sort=False):
+        passages[plaque] = grp[ecols].to_dict('records')
 
     return passages
 
@@ -1478,7 +1518,7 @@ async def count_peage_file(request: Request):
     async def generate():
         try:
             key = _pp_cache_key_peage(content)
-            cached = _cache_get(key)
+            cached = _pp_cache_get(key)
 
             if cached is not None:
                 passages = cached.get('plaques', {})
@@ -1486,7 +1526,7 @@ async def count_peage_file(request: Request):
             else:
                 yield f"data: {json.dumps({'type': 'progress', 'message': f'Lecture {nom}…'})}\n\n"
                 passages = _extract_passages_peage(content, nom)
-                _cache_set(key, {'plaques': passages})
+                _pp_cache_set(key, {'plaques': passages})
                 yield f"data: {json.dumps({'type': 'progress', 'message': f'{nom} : {len(passages)} plaques trouvées'})}\n\n"
 
             counts: dict = {}
