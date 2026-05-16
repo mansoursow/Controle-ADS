@@ -1,4 +1,5 @@
 import React, { useState, useRef } from 'react';
+import { API } from '../api';
 
 function base64ToBlobUrl(b64) {
   const binary = atob(b64);
@@ -114,7 +115,7 @@ export default function AuditPage({ onBack }) {
         formData.append('is_last_chunk', ci === chunks.length - 1 ? 'true' : 'false');
         formData.append('chunk_index', String(ci));
         for (const p of chunks[ci]) formData.append('images', p);
-        const res = await fetch('/audit', { method: 'POST', body: formData, signal: abortControllerRef.current.signal });
+        const res = await fetch(`${API}/audit`, { method: 'POST', body: formData, signal: abortControllerRef.current.signal });
         if (!res.ok) throw new Error(`Batch ${ci + 1} — HTTP ${res.status}`);
         await processStream(res, receivedCountRef, totalWithRef);
       }

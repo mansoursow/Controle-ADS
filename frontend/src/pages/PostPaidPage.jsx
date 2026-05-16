@@ -1,4 +1,5 @@
 import React, { useState, useRef, useCallback } from 'react';
+import { API } from '../api';
 
 const fmt    = (n) => n != null ? Number(n).toLocaleString('fr-FR') : '—';
 const fmtCFA = (n) => (n != null && n !== 0) ? Number(n).toLocaleString('fr-FR') + ' F' : '—';
@@ -238,7 +239,7 @@ export default function PostPaidPage({ onBack }) {
       addLog(`📋 Lecture de la facturation : ${fichierFacture.name}`);
       const fd1 = new FormData();
       fd1.append('fichier_facture', fichierFacture);
-      const resp = await fetch('/controle-postpaid/facture', { method: 'POST', body: fd1, signal });
+      const resp = await fetch(`${API}/controle-postpaid/facture`, { method: 'POST', body: fd1, signal });
       if (!resp.ok) throw new Error(`Erreur lecture facture : HTTP ${resp.status}`);
       const factureData = await resp.json();
       if (factureData.error) throw new Error(factureData.error);
@@ -267,7 +268,7 @@ export default function PostPaidPage({ onBack }) {
         fd2.append('fichier_peage', f);
         fd2.append('plaques_cibles', JSON.stringify(plaqueCibles));
 
-        await readSSE('/controle-postpaid/peage-file', fd2, (evt) => {
+        await readSSE(`${API}/controle-postpaid/peage-file`, fd2, (evt) => {
           if (evt.type === 'progress') addLog(evt.message, 'progress');
           if (evt.type === 'erreur')   addLog(evt.message, 'error');
           if (evt.type === 'resultat') {

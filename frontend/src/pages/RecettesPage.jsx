@@ -1,4 +1,5 @@
 import React, { useState, useRef, useCallback, useMemo } from 'react';
+import { API } from '../api';
 
 const GRAN_LABELS = { jour: 'Par Jour', mois: 'Par Mois', annee: 'Par Année' };
 const fmt     = (n) => n != null ? Number(n).toLocaleString('fr-FR') : '—';
@@ -281,7 +282,7 @@ export default function RecettesPage({ onBack }) {
     form.append('fichier', fich.file);
     form.append('granularite', granularite);
 
-    const res = await fetch('/analyser-excel', { method: 'POST', body: form, signal });
+    const res = await fetch(`${API}/analyser-excel`, { method: 'POST', body: form, signal });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
     const reader  = res.body.getReader();
@@ -377,7 +378,7 @@ export default function RecettesPage({ onBack }) {
       const form = new FormData();
       form.append('rapport', rapportFile);
       form.append('totals', JSON.stringify(recettes.totals));
-      const res  = await fetch('/comparer-totaux', { method: 'POST', body: form });
+      const res  = await fetch(`${API}/comparer-totaux`, { method: 'POST', body: form });
       const data = await res.json();
       if (data.error) { setCompareError(data.error); return; }
       setComparison(data);
